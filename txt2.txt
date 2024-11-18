@@ -1,0 +1,128 @@
+# Import Libraries
+import pandas as pd
+import numpy as np
+from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score
+from azureml.core import Workspace, Experiment
+from azureml.train.automl import AutoMLConfig
+from azureml.core.model import Model
+from azureml.core.webservice import AciWebservice
+from azureml.core.model import InferenceConfig
+import joblib
+import requests
+
+# Step 1: Pull Data from ADX
+def pull_data_from_adx(cluster, database, query):
+    """
+    Pull data from Azure Data Explorer (ADX).
+    """
+    kcsb = KustoConnectionStringBuilder.with_az_cli_authentication(cluster)
+    client = KustoClient(kcsb)
+    response = client.execute(database, query)
+    return response.primary_results[0].to_dataframe()
+
+# Example usage (replace with your values)
+# cluster = "https://<your-cluster>.kusto.windows.net"
+# database = "<your-database>"
+# query = "<your-query>"
+# data = pull_data_from_adx(cluster, database, query)
+
+# Step 2: Data Cleaning and Preprocessing
+def clean_and_preprocess(data):
+    """
+    Cleans and preprocesses the data.
+    """
+    data.dropna(inplace=True)
+    data.drop_duplicates(inplace=True)
+    data['timestamp'] = pd.to_datetime(data['timestamp'])
+    data.sort_values(by='timestamp', inplace=True)
+    data['value_diff'] = data['value'].diff()
+    data.dropna(inplace=True)
+    scaler = MinMaxScaler()
+    data['value_scaled'] = scaler.fit_transform(data[['value']])
+    return data
+
+# Example usage
+# processed_data = clean_and_preprocess(data)
+
+# Step 3: Train Model Using Azure AutoML
+def train_model(training_data, label_column, workspace_config="config.json"):
+    """
+    Trains a model using Azure AutoML.
+    """
+    ws = Workspace.from_config(path=workspace_config)
+    experiment = Experiment(ws, "adx-anomaly-detection")
+    
+    automl_config = AutoMLConfig(
+        task="classification",
+        training_data=training_data,
+        label_column_name=label_column,
+        primary_metric="accuracy",
+        compute_target="local",
+        max_concurrent_iterations=4
+    )
+    
+    run = experiment.submit(automl_config)
+    run.wait_for_completion()
+    return run.get_output()
+
+# Example usage (replace with your training data)
+# best_model, fitted_model = train_model(processed_data, "label_column")
+
+# Step 4: Test Model and Compare with Abacus API
+def test_model(fitted_model, X_test, y_test, abacus_url=None, api_key=None):
+    """
+    Tests the model and optionally compares it with an Abacus API model.
+    """
+    predictions = fitted_model.predict(X_test)
+    accuracy = accuracy_score(y_test, predictions)
+    print(f"Model Accuracy: {accuracy}")
+    
+    if abacus_url and api_key:
+        response = requests.post(
+            abacus_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"data": X_test.to_dict(orient="records")}
+        )
+        abacus_predictions = response.json().get("predictions", [])
+        abacus_accuracy = accuracy_score(y_test, abacus_predictions)
+        print(f"Abacus Model Accuracy: {abacus_accuracy}")
+        return accuracy, abacus_accuracy
+    
+    return accuracy
+
+# Example usage (replace with your data and API details)
+# accuracy = test_model(fitted_model, X_test, y_test)
+
+# Step 5: Deploy Model as a Web Service
+def deploy_model(workspace, model, environment, service_name="anomaly-detection-service"):
+    """
+    Deploy the trained model as a web service.
+    """
+    inference_config = InferenceConfig(entry_script="score.py", environment=environment)
+    aci_config = AciWebservice.deploy_configuration(cpu_cores=1, memory_gb=1)
+    service = Model.deploy(workspace, service_name, [model], inference_config, aci_config)
+    service.wait_for_deployment()
+    return service.scoring_uri
+
+# Example usage (replace with your values)
+# scoring_uri = deploy_model(ws, model, environment)
+
+# Step 6: Inference Script (Save as "score.py" for deployment)
+def save_inference_script():
+    script = """
+def init():
+    global model
+    model = joblib.load("model.pkl")
+
+def run(data):
+    inputs = np.array(data["data"])
+    predictions = model.predict(inputs)
+    return {"predictions": predictions.tolist()}
+"""
+    with open("score.py", "w") as f:
+        f.write(script)
+
+# Save inference script
+save_inference_script()
